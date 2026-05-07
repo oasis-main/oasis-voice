@@ -1,0 +1,28 @@
+# Dockerfile.gpu — Nimbus & oasis-ai pro tiers. CUDA + vLLM + vllm-omni.
+# Target: 16GB VRAM minimum (Voxtral-Realtime + CosyVoice 2 each need ~16GB).
+# If you only need one of stream-pro / clone-pro at a time, this fits on one card.
+#
+# Sketch — not yet built.
+
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    VOICE_STT_TIER=stream-pro \
+    VOICE_TTS_TIER=clone-pro
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3.12 python3.12-venv python3-pip \
+      libsndfile1 ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+RUN ln -sf /usr/bin/python3.12 /usr/bin/python
+
+WORKDIR /srv
+COPY pyproject.toml ./
+COPY src ./src
+
+# vLLM + vllm-omni install heavy CUDA wheels; this layer is the long one.
+RUN pip install -e ".[cpu,gpu]"
+
+EXPOSE 8731
+CMD ["uvicorn", "oasis_voice.main:app", "--host", "0.0.0.0", "--port", "8731"]

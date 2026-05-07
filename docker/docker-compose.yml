@@ -1,0 +1,40 @@
+# Docker Compose for oasis-voice-server. Two profiles: cpu (cloud MVP) and
+# gpu (Nimbus / oasis-ai pro tier). Same service name, same port, different
+# image and tier env. Sketch.
+
+services:
+  voice:
+    image: oasis-voice-server:cpu
+    profiles: ["cpu"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cpu
+    environment:
+      VOICE_STT_TIER: ${VOICE_STT_TIER:-lite}
+      VOICE_TTS_TIER: ${VOICE_TTS_TIER:-lite}
+    ports: ["8731:8731"]
+    volumes:
+      - voice-weights:/srv/weights        # persisted across image rebuilds
+
+  voice-gpu:
+    image: oasis-voice-server:gpu
+    profiles: ["gpu"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gpu
+    environment:
+      VOICE_STT_TIER: ${VOICE_STT_TIER:-stream-pro}
+      VOICE_TTS_TIER: ${VOICE_TTS_TIER:-clone-pro}
+    ports: ["8731:8731"]
+    volumes:
+      - voice-weights:/srv/weights
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  voice-weights:

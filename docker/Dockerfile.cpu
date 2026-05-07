@@ -1,0 +1,28 @@
+# Dockerfile.cpu — cloud-MVP image. Only lite/default/stream-light tiers.
+# Target: small (≲500MB), boots in <10s, runs on a 1-core/2GB VM.
+#
+# Sketch — not yet built. Pin Python and tier extras before first build.
+
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    VOICE_STT_TIER=lite \
+    VOICE_TTS_TIER=lite
+
+# System deps for soundfile / piper / sherpa-onnx
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libsndfile1 ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /srv
+COPY pyproject.toml ./
+COPY src ./src
+
+# Install only the cpu bundle — gpu deps deliberately excluded.
+RUN pip install -e ".[cpu]"
+
+# Weights are NOT baked in. The image runs `download-weights.py` on first boot
+# (or pulls from a mounted volume) so the same image works for any tier.
+EXPOSE 8731
+CMD ["uvicorn", "oasis_voice.main:app", "--host", "0.0.0.0", "--port", "8731"]

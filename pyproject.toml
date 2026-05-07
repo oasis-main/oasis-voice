@@ -1,0 +1,40 @@
+[project]
+name = "oasis-voice-server"
+version = "0.0.1"
+description = "License-clean speech sidecar for openclaw / oasis-claw"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "pydantic>=2.9",
+  "soundfile>=0.12",
+  "numpy>=1.26",
+]
+
+# Tier-scoped extras keep the cpu image small. Install only what you need.
+[project.optional-dependencies]
+# ── STT tiers ──
+lite-stt        = ["moonshine-onnx>=0.1"]                 # tier=lite
+default-stt     = ["faster-whisper>=1.1"]                 # tier=default
+stream-light    = ["sherpa-onnx>=1.12"]                   # tier=stream-light
+stream-pro      = ["vllm>=0.7", "torch>=2.5"]             # tier=stream-pro (GPU)
+accuracy        = ["nemo-toolkit[asr]>=2.0"]              # tier=accuracy (GPU)
+
+# ── TTS tiers ──
+lite-tts        = ["piper-tts>=1.2"]                      # tier=lite
+default-tts     = ["kokoro>=0.7"]                         # tier=default
+natural         = ["melo-tts>=0.1"]                       # tier=natural (GPU)
+style           = ["styletts2-gruut>=0.1"]                # tier=style (MIT variant)
+clone-light     = ["openvoice-v2>=2.0"]                   # tier=clone-light (GPU)
+clone-pro       = ["cosyvoice>=2.0", "vllm-omni>=0.18"]   # tier=clone-pro (GPU)
+
+# Convenience bundles
+cpu             = ["oasis-voice-server[lite-stt,default-stt,stream-light,lite-tts,default-tts]"]
+gpu             = ["oasis-voice-server[stream-pro,accuracy,natural,style,clone-light,clone-pro]"]
+
+[project.scripts]
+oasis-voice-download = "oasis_voice.scripts.download_weights:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
