@@ -1,4 +1,4 @@
-# oasis-voice-server
+# oasis-voice
 
 A self-hosted, license-clean speech sidecar for openclaw / oasis-claw agents
 (and the per-tenant backend for oasis-ai's hosted speech endpoints).
@@ -77,7 +77,7 @@ VOICE_STT_TIER=stream-pro VOICE_TTS_TIER=clone-pro \
 ## Repo layout
 
 ```
-oasis-voice-server/
+oasis-voice/
 ├── README.md                            ← this file
 ├── pyproject.toml                       ← deps split by tier (extras)
 ├── docker/
@@ -122,7 +122,7 @@ oasis-voice-server/
 2. **vLLM coupling.** `stream-pro` (Voxtral-Realtime) requires vLLM with a
    custom architecture; `clone-pro` requires `vllm-omni`. These can't share
    a single Python process cleanly. Likely answer: GPU profile runs them as
-   separate subprocesses, oasis-voice-server proxies to each via local HTTP.
+   separate subprocesses, oasis-voice proxies to each via local HTTP.
 
 3. **Voice cloning consent.** Cloned voices need a recorded consent step —
    we'll not allow `/v1/voice/clone` to succeed without an attestation token.

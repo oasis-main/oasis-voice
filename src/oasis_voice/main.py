@@ -1,25 +1,62 @@
 """
-FastAPI entrypoint — sketch.
+FastAPI entrypoint.
 
-This file declares the route surface the openclaw voice-call provider talks
-to. Concrete handlers are stubs that return 501 until the corresponding
-backend module is implemented.
+The route surface is what the openclaw voice-call provider speaks. We
+instantiate exactly the active STT and TTS backends at startup — anything
+else stays advertised on /v1/tiers but unloaded.
 
-Run (once deps are installed):
-  uvicorn oasis_voice.main:app --host 0.0.0.0 --port 8731
+Run:
+    uvicorn oasis_voice.main:app --host 0.0.0.0 --port 8731
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import os
+from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, WebSocket
+from fastapi.websockets import WebSocketDisconnect
+from pydantic import BaseModel, Field
 
+from .audio import decode_wav, encode_wav, frame_iterator
 from .config import resolve_active
+from .loader import make_stt, make_tts
+from .stt.base import STTBackend
 from .tiers import all_tiers
+from .tts.base import TTSBackend, VoiceRef
 
-app = FastAPI(title="oasis-voice-server", version="0.0.1-sketch")
+
+log = logging.getLogger("oasis_voice")
 ACTIVE = resolve_active()
+
+# Set during lifespan startup.
+_stt: STTBackend | None = None
+_tts: TTSBackend | None = None
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    global _stt, _tts
+    skip_warmup = os.environ.get("VOICE_SKIP_WARMUP") == "1"
+    _stt = make_stt(ACTIVE.stt.backend)
+    _tts = make_tts(ACTIVE.tts.backend)
+    if not skip_warmup:
+        await asyncio.gather(_stt.warmup(), _tts.warmup())
+        log.info(
+            "warmup complete: stt=%s tts=%s", ACTIVE.stt.backend, ACTIVE.tts.backend
+        )
+    else:
+        log.warning("VOICE_SKIP_WARMUP=1 — backends will load on first request")
+    yield
+
+
+app = FastAPI(title="oasis-voice", version="0.1.0", lifespan=lifespan)
+
+
+# ─────────────────────────── meta ───────────────────────────
 
 
 @app.get("/healthz")
@@ -28,17 +65,16 @@ def healthz() -> dict[str, Any]:
         "ok": True,
         "stt_tier": ACTIVE.stt.name,
         "stt_backend": ACTIVE.stt.backend,
-        "stt_loaded": False,                   # backends not wired yet
+        "stt_loaded": _stt is not None,
         "tts_tier": ACTIVE.tts.name,
         "tts_backend": ACTIVE.tts.backend,
-        "tts_loaded": False,
+        "tts_loaded": _tts is not None,
         "has_gpu": ACTIVE.has_gpu,
     }
 
 
 @app.get("/v1/tiers")
 def list_tiers() -> dict[str, Any]:
-    """Advertise every tier the build supports — not just the loaded ones."""
     return {
         "active": {"stt": ACTIVE.stt.name, "tts": ACTIVE.tts.name},
         "tiers": [
@@ -58,33 +94,170 @@ def list_tiers() -> dict[str, Any]:
     }
 
 
-# All real handlers below are stubs. Implementing them is the next milestone.
+# ─────────────────────────── STT ───────────────────────────
+
+
+def _require_stt() -> STTBackend:
+    if _stt is None:
+        raise HTTPException(503, "STT backend not loaded yet")
+    return _stt
+
 
 @app.post("/v1/stt/transcribe")
-async def stt_transcribe() -> Any:
-    raise HTTPException(501, "not yet implemented — see stt/{moonshine,whisper,...}.py")
+async def stt_transcribe(audio: UploadFile = File(...)) -> dict[str, Any]:
+    backend = _require_stt()
+    raw = await audio.read()
+    try:
+        pcm, sr, _ch = decode_wav(raw)
+    except Exception as e:
+        raise HTTPException(415, f"unsupported audio format: {e}") from e
+    chunk = await backend.transcribe(pcm, sample_rate=sr)
+    return {
+        "text": chunk.text,
+        "is_final": chunk.is_final,
+        "start_ms": chunk.start_ms,
+        "end_ms": chunk.end_ms,
+        "confidence": chunk.confidence,
+        "language": chunk.language,
+    }
 
 
 @app.websocket("/v1/stt/stream")
-async def stt_stream(*_: Any, **__: Any) -> Any:
-    raise HTTPException(501, "not yet implemented")
+async def stt_stream(ws: WebSocket) -> None:
+    await ws.accept()
+    backend = _require_stt()
+    sample_rate = int(ws.query_params.get("sample_rate", "16000"))
+
+    async def frames():
+        try:
+            while True:
+                msg = await ws.receive()
+                if msg.get("type") == "websocket.disconnect":
+                    return
+                data = msg.get("bytes")
+                if data:
+                    yield data
+                # Text messages reserved for control; ignored for now.
+        except WebSocketDisconnect:
+            return
+
+    try:
+        async for chunk in backend.stream(frames(), sample_rate=sample_rate):
+            await ws.send_json(
+                {
+                    "text": chunk.text,
+                    "is_final": chunk.is_final,
+                    "start_ms": chunk.start_ms,
+                    "end_ms": chunk.end_ms,
+                    "confidence": chunk.confidence,
+                    "language": chunk.language,
+                }
+            )
+            if chunk.is_final:
+                break
+    except WebSocketDisconnect:
+        pass
+    finally:
+        try:
+            await ws.close()
+        except RuntimeError:
+            pass
+
+
+# ─────────────────────────── TTS ───────────────────────────
+
+
+class SpeakRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=4096)
+    voice: str | None = None  # e.g. "piper:en_US-lessac-high"; backend default if None
+
+
+def _require_tts() -> TTSBackend:
+    if _tts is None:
+        raise HTTPException(503, "TTS backend not loaded yet")
+    return _tts
+
+
+def _voice_ref(name: str | None) -> VoiceRef:
+    if not name:
+        return VoiceRef(voice_id="", kind="preset")
+    kind = "clone" if name.startswith("clone:") else "preset"
+    return VoiceRef(voice_id=name, kind=kind)
 
 
 @app.post("/v1/tts/speak")
-async def tts_speak() -> Any:
-    raise HTTPException(501, "not yet implemented — see tts/{piper,kokoro,...}.py")
+async def tts_speak(req: SpeakRequest) -> Response:
+    backend = _require_tts()
+    chunk = await backend.speak(req.text, _voice_ref(req.voice))
+    wav = encode_wav(chunk.pcm, chunk.sample_rate, channels=chunk.channels)
+    return Response(content=wav, media_type="audio/wav")
 
 
 @app.websocket("/v1/tts/stream")
-async def tts_stream(*_: Any, **__: Any) -> Any:
-    raise HTTPException(501, "not yet implemented")
+async def tts_stream(ws: WebSocket) -> None:
+    await ws.accept()
+    backend = _require_tts()
+    try:
+        spec = await ws.receive_json()
+    except Exception as e:
+        await ws.close(code=1003, reason=f"bad request: {e}")
+        return
+
+    text = (spec.get("text") or "").strip()
+    voice_name = spec.get("voice")
+    if not text:
+        await ws.close(code=1003, reason="missing 'text'")
+        return
+
+    voice = _voice_ref(voice_name)
+    try:
+        first = True
+        async for chunk in backend.stream(text, voice):
+            if first:
+                await ws.send_json(
+                    {
+                        "type": "header",
+                        "sample_rate": chunk.sample_rate,
+                        "channels": chunk.channels,
+                        "encoding": "pcm_s16le",
+                    }
+                )
+                first = False
+            for frame in frame_iterator(chunk.pcm, chunk.sample_rate):
+                await ws.send_bytes(frame)
+            await ws.send_json({"type": "boundary", "is_final": chunk.is_final})
+    except WebSocketDisconnect:
+        return
+    finally:
+        try:
+            await ws.close()
+        except RuntimeError:
+            pass
+
+
+# ─────────────────────────── voice registry ───────────────────────────
 
 
 @app.post("/v1/voice/clone")
-async def voice_clone() -> Any:
-    raise HTTPException(501, "not yet implemented — clone-light/clone-pro tiers only")
+async def voice_clone(
+    audio: UploadFile = File(...),
+    voice_id: str = Form(...),
+) -> dict[str, Any]:
+    backend = _require_tts()
+    if not backend.supports_cloning:
+        raise HTTPException(
+            501,
+            f"active TTS backend '{ACTIVE.tts.backend}' does not support cloning. "
+            f"Switch to a clone-light or clone-pro tier.",
+        )
+    raw = await audio.read()
+    pcm, sr, _ = decode_wav(raw)
+    ref = await backend.clone(reference_pcm=pcm, sample_rate=sr, voice_id=voice_id)
+    return {"voice_id": ref.voice_id, "kind": ref.kind}
 
 
 @app.get("/v1/voices")
-async def list_voices() -> Any:
+async def list_voices() -> dict[str, Any]:
+    # Preset registry is per-backend; lite/Piper resolves voices from disk
+    # at request time, so we intentionally don't enumerate them here yet.
     return {"presets": [], "cloned": []}

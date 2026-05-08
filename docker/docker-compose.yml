@@ -1,10 +1,10 @@
-# Docker Compose for oasis-voice-server. Two profiles: cpu (cloud MVP) and
+# Docker Compose for oasis-voice. Two profiles: cpu (cloud MVP) and
 # gpu (Nimbus / oasis-ai pro tier). Same service name, same port, different
 # image and tier env. Sketch.
 
 services:
   voice:
-    image: oasis-voice-server:cpu
+    image: oasis-voice:cpu
     profiles: ["cpu"]
     build:
       context: ..
@@ -17,7 +17,7 @@ services:
       - voice-weights:/srv/weights        # persisted across image rebuilds
 
   voice-gpu:
-    image: oasis-voice-server:gpu
+    image: oasis-voice:gpu
     profiles: ["gpu"]
     build:
       context: ..

@@ -11,3 +11,6 @@ weights/
 *.flac
 .pytest_cache/
 .mypy_cache/
+*.egg-info/
+build/
+dist/
