@@ -21,7 +21,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, We
 from fastapi.websockets import WebSocketDisconnect
 from pydantic import BaseModel, Field
 
-from .audio import decode_wav, encode_wav, frame_iterator
+from .audio import AudioDecodeError, decode_audio_any, decode_wav, encode_wav, frame_iterator
 from .config import resolve_active
 from .loader import make_stt, make_tts
 from .stt.base import STTBackend
@@ -108,9 +108,13 @@ async def stt_transcribe(audio: UploadFile = File(...)) -> dict[str, Any]:
     backend = _require_stt()
     raw = await audio.read()
     try:
-        pcm, sr, _ch = decode_wav(raw)
-    except Exception as e:
+        pcm, sr, _ch = decode_audio_any(
+            raw, mime=audio.content_type, file_name=audio.filename
+        )
+    except AudioDecodeError as e:
         raise HTTPException(415, f"unsupported audio format: {e}") from e
+    except Exception as e:
+        raise HTTPException(415, f"audio decode failed: {e}") from e
     chunk = await backend.transcribe(pcm, sample_rate=sr)
     return {
         "text": chunk.text,
