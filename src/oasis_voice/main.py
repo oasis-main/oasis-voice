@@ -21,7 +21,14 @@ from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, We
 from fastapi.websockets import WebSocketDisconnect
 from pydantic import BaseModel, Field
 
-from .audio import AudioDecodeError, decode_audio_any, decode_wav, encode_wav, frame_iterator
+from .audio import (
+    AudioDecodeError,
+    decode_audio_any,
+    decode_wav,
+    encode_opus,
+    encode_wav,
+    frame_iterator,
+)
 from .config import resolve_active
 from .loader import make_stt, make_tts
 from .stt.base import STTBackend
@@ -190,11 +197,26 @@ def _voice_ref(name: str | None) -> VoiceRef:
 
 
 @app.post("/v1/tts/speak")
-async def tts_speak(req: SpeakRequest) -> Response:
+async def tts_speak(req: SpeakRequest, format: str = "wav") -> Response:
+    """
+    Synthesize `req.text` to audio. Default output is WAV; pass
+    `?format=opus` to receive Opus-in-OGG (used by channels that
+    treat opus specifically as a "voice note" — Telegram sendVoice,
+    iMessage audio messages, etc.).
+    """
     backend = _require_tts()
     chunk = await backend.speak(req.text, _voice_ref(req.voice))
-    wav = encode_wav(chunk.pcm, chunk.sample_rate, channels=chunk.channels)
-    return Response(content=wav, media_type="audio/wav")
+    fmt = format.lower().strip()
+    if fmt == "wav":
+        wav = encode_wav(chunk.pcm, chunk.sample_rate, channels=chunk.channels)
+        return Response(content=wav, media_type="audio/wav")
+    if fmt in ("opus", "ogg", "ogg-opus"):
+        try:
+            opus = encode_opus(chunk.pcm, chunk.sample_rate, channels=chunk.channels)
+        except AudioDecodeError as e:
+            raise HTTPException(500, f"opus encode failed: {e}") from e
+        return Response(content=opus, media_type="audio/ogg")
+    raise HTTPException(400, f"unsupported format='{format}'; supported: wav, opus")
 
 
 @app.websocket("/v1/tts/stream")

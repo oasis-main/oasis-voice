@@ -62,6 +62,68 @@ def encode_wav(pcm: bytes, sample_rate: int, channels: int = 1) -> bytes:
     return buf.getvalue()
 
 
+def encode_opus(pcm: bytes, sample_rate: int, channels: int = 1) -> bytes:
+    """
+    Wrap raw PCM in an Opus-in-OGG container suitable for telegram
+    `sendVoice` (and iMessage audio messages, browser MediaSource, etc.).
+
+    Telegram only treats `.ogg/opus` audio as a true "voice note" — WAV
+    is uploaded as a generic audio file. Doing the WAV→opus transcode
+    server-side keeps the Node-side SpeechProvider plugin lean and
+    consistent with the inbound path (`decode_audio_any` also routes
+    non-WAV through ffmpeg).
+
+    Bitrate: 24kbps mono is Telegram's preferred voice-note bitrate.
+    For higher fidelity (e.g. music TTS), callers can encode WAV
+    locally and bypass this helper.
+    """
+    if not _ffmpeg_available():
+        raise AudioDecodeError(
+            "ffmpeg not found on PATH — needed to encode opus output."
+        )
+    # Build a minimal in-memory WAV from the raw PCM so ffmpeg sees a
+    # parseable container. We could also pipe raw `-f s16le` but the
+    # WAV header is essentially free and lets ffmpeg sniff sample-rate
+    # changes if a backend overrides chunk.sample_rate mid-stream.
+    wav = encode_wav(pcm, sample_rate=sample_rate, channels=channels)
+    cmd = [
+        "ffmpeg",
+        "-loglevel",
+        "error",
+        "-i",
+        "pipe:0",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "24k",
+        "-ar",
+        "48000",  # Opus is fixed at 48 kHz internally; resample once here.
+        "-ac",
+        str(channels),
+        "-f",
+        "ogg",
+        "pipe:1",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=wav,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as e:
+        raise AudioDecodeError(
+            f"ffmpeg timed out encoding {len(pcm)} bytes of PCM"
+        ) from e
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+        raise AudioDecodeError(f"ffmpeg opus encode exit {proc.returncode}: {stderr[:240]}")
+    if not proc.stdout:
+        raise AudioDecodeError("ffmpeg produced empty opus output")
+    return proc.stdout
+
+
 def decode_wav(data: bytes) -> tuple[bytes, int, int]:
     """
     WAV/FLAC/Vorbis-OGG (anything libsndfile reads natively) → (pcm16_bytes, sample_rate, channels).

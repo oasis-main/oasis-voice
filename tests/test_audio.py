@@ -171,6 +171,49 @@ def test_decode_audio_any_handles_ffmpeg_timeout(monkeypatch):
         decode_audio_any(b"x" * 1000, mime="audio/opus")
 
 
+def test_encode_opus_requires_ffmpeg(monkeypatch):
+    """Without ffmpeg on PATH the encode helper raises a clear error."""
+    from oasis_voice.audio import encode_opus
+
+    monkeypatch.setattr("oasis_voice.audio.shutil.which", lambda _: None)
+    with pytest.raises(AudioDecodeError, match="ffmpeg not found"):
+        encode_opus(b"\x00\x00" * 100, sample_rate=22050, channels=1)
+
+
+def test_encode_opus_propagates_ffmpeg_failure(monkeypatch):
+    """ffmpeg non-zero exit during encode → AudioDecodeError with stderr."""
+    from oasis_voice.audio import encode_opus
+
+    monkeypatch.setattr("oasis_voice.audio.shutil.which", lambda _: "/usr/bin/ffmpeg")
+
+    fake_result = subprocess.CompletedProcess(
+        args=["ffmpeg"], returncode=1, stdout=b"", stderr=b"libopus not found"
+    )
+    monkeypatch.setattr(
+        "oasis_voice.audio.subprocess.run",
+        lambda *_a, **_kw: fake_result,
+    )
+    with pytest.raises(AudioDecodeError, match="opus encode exit 1.*libopus not found"):
+        encode_opus(b"\x00\x00" * 100, sample_rate=22050, channels=1)
+
+
+@needs_ffmpeg
+def test_encode_opus_roundtrip_via_real_ffmpeg():
+    """
+    End-to-end: synthesize raw PCM silence, encode to opus, verify the
+    output is an OGG file (magic bytes 'OggS') of plausible size.
+    Skipped on bare hosts; runs in the oasis-voice CPU image.
+    """
+    from oasis_voice.audio import encode_opus
+
+    pcm = float32_to_pcm16(np.zeros(22050 // 2, dtype=np.float32))  # 0.5s
+    out = encode_opus(pcm, sample_rate=22050, channels=1)
+    assert out.startswith(b"OggS"), "expected OGG page magic"
+    # 0.5s of silence at 24kbps opus ≈ 1.5KB; loosely bound to catch
+    # an "empty output" regression without being flaky on framing.
+    assert 200 < len(out) < 50_000
+
+
 @needs_ffmpeg
 def test_decode_audio_any_opus_roundtrip_via_real_ffmpeg(tmp_path):
     """

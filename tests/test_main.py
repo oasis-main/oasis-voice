@@ -120,6 +120,40 @@ def test_tts_speak(client):
     assert r.content[:4] == b"RIFF"
 
 
+def test_tts_speak_rejects_unknown_format(client):
+    r = client.post(
+        "/v1/tts/speak?format=mp3",
+        json={"text": "hi"},
+    )
+    assert r.status_code == 400
+    assert "unsupported format" in r.json()["detail"]
+
+
+def test_tts_speak_opus_calls_encoder(client, monkeypatch):
+    """
+    With format=opus the endpoint should route through encode_opus.
+    We monkeypatch the encoder so this works on hosts without ffmpeg
+    (the real-ffmpeg path is covered in test_audio.py's
+    test_encode_opus_roundtrip_via_real_ffmpeg).
+    """
+    import oasis_voice.main as voice_main
+
+    called = {"hit": False, "args": None}
+
+    def fake_encode(pcm, sample_rate, channels=1):
+        called["hit"] = True
+        called["args"] = (len(pcm), sample_rate, channels)
+        return b"OggS" + b"\x00" * 64
+
+    monkeypatch.setattr(voice_main, "encode_opus", fake_encode)
+
+    r = client.post("/v1/tts/speak?format=opus", json={"text": "hi"})
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "audio/ogg"
+    assert r.content.startswith(b"OggS")
+    assert called["hit"], "encode_opus was not called"
+
+
 def test_voice_clone_unsupported(client):
     pcm = float32_to_pcm16(np.zeros(16000, dtype=np.float32))
     wav = encode_wav(pcm, sample_rate=16000)
