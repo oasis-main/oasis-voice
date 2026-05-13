@@ -43,21 +43,58 @@ ACTIVE = resolve_active()
 _stt: STTBackend | None = None
 _tts: TTSBackend | None = None
 
+# Lazy-warmup state. When VOICE_SKIP_WARMUP=1 we defer the model load to the
+# first request and gate it on these flags+locks so concurrent requests don't
+# race the model into existence twice.
+_stt_warmed = False
+_tts_warmed = False
+_stt_warmup_lock: asyncio.Lock | None = None
+_tts_warmup_lock: asyncio.Lock | None = None
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global _stt, _tts
+    global _stt, _tts, _stt_warmed, _tts_warmed
+    global _stt_warmup_lock, _tts_warmup_lock
     skip_warmup = os.environ.get("VOICE_SKIP_WARMUP") == "1"
     _stt = make_stt(ACTIVE.stt.backend)
     _tts = make_tts(ACTIVE.tts.backend)
+    _stt_warmup_lock = asyncio.Lock()
+    _tts_warmup_lock = asyncio.Lock()
     if not skip_warmup:
         await asyncio.gather(_stt.warmup(), _tts.warmup())
+        _stt_warmed = True
+        _tts_warmed = True
         log.info(
             "warmup complete: stt=%s tts=%s", ACTIVE.stt.backend, ACTIVE.tts.backend
         )
     else:
         log.warning("VOICE_SKIP_WARMUP=1 — backends will load on first request")
     yield
+
+
+async def _ensure_stt_warmed() -> None:
+    global _stt_warmed
+    if _stt_warmed or _stt is None or _stt_warmup_lock is None:
+        return
+    async with _stt_warmup_lock:
+        if _stt_warmed:
+            return
+        log.info("lazy-loading STT backend on first request: %s", ACTIVE.stt.backend)
+        await _stt.warmup()
+        _stt_warmed = True
+
+
+async def _ensure_tts_warmed() -> None:
+    global _tts_warmed
+    if _tts_warmed or _tts is None or _tts_warmup_lock is None:
+        return
+    async with _tts_warmup_lock:
+        if _tts_warmed:
+            return
+        log.info("lazy-loading TTS backend on first request: %s", ACTIVE.tts.backend)
+        await _tts.warmup()
+        _tts_warmed = True
 
 
 app = FastAPI(title="oasis-voice", version="0.1.0", lifespan=lifespan)
@@ -72,10 +109,12 @@ def healthz() -> dict[str, Any]:
         "ok": True,
         "stt_tier": ACTIVE.stt.name,
         "stt_backend": ACTIVE.stt.backend,
-        "stt_loaded": _stt is not None,
+        "stt_instantiated": _stt is not None,
+        "stt_loaded": _stt_warmed,
         "tts_tier": ACTIVE.tts.name,
         "tts_backend": ACTIVE.tts.backend,
-        "tts_loaded": _tts is not None,
+        "tts_instantiated": _tts is not None,
+        "tts_loaded": _tts_warmed,
         "has_gpu": ACTIVE.has_gpu,
     }
 
@@ -104,15 +143,16 @@ def list_tiers() -> dict[str, Any]:
 # ─────────────────────────── STT ───────────────────────────
 
 
-def _require_stt() -> STTBackend:
+async def _require_stt() -> STTBackend:
     if _stt is None:
-        raise HTTPException(503, "STT backend not loaded yet")
+        raise HTTPException(503, "STT backend not instantiated yet")
+    await _ensure_stt_warmed()
     return _stt
 
 
 @app.post("/v1/stt/transcribe")
 async def stt_transcribe(audio: UploadFile = File(...)) -> dict[str, Any]:
-    backend = _require_stt()
+    backend = await _require_stt()
     raw = await audio.read()
     try:
         pcm, sr, _ch = decode_audio_any(
@@ -136,7 +176,7 @@ async def stt_transcribe(audio: UploadFile = File(...)) -> dict[str, Any]:
 @app.websocket("/v1/stt/stream")
 async def stt_stream(ws: WebSocket) -> None:
     await ws.accept()
-    backend = _require_stt()
+    backend = await _require_stt()
     sample_rate = int(ws.query_params.get("sample_rate", "16000"))
 
     async def frames():
@@ -183,9 +223,10 @@ class SpeakRequest(BaseModel):
     voice: str | None = None  # e.g. "piper:en_US-lessac-high"; backend default if None
 
 
-def _require_tts() -> TTSBackend:
+async def _require_tts() -> TTSBackend:
     if _tts is None:
-        raise HTTPException(503, "TTS backend not loaded yet")
+        raise HTTPException(503, "TTS backend not instantiated yet")
+    await _ensure_tts_warmed()
     return _tts
 
 
@@ -204,7 +245,7 @@ async def tts_speak(req: SpeakRequest, format: str = "wav") -> Response:
     treat opus specifically as a "voice note" — Telegram sendVoice,
     iMessage audio messages, etc.).
     """
-    backend = _require_tts()
+    backend = await _require_tts()
     chunk = await backend.speak(req.text, _voice_ref(req.voice))
     fmt = format.lower().strip()
     if fmt == "wav":
@@ -222,7 +263,7 @@ async def tts_speak(req: SpeakRequest, format: str = "wav") -> Response:
 @app.websocket("/v1/tts/stream")
 async def tts_stream(ws: WebSocket) -> None:
     await ws.accept()
-    backend = _require_tts()
+    backend = await _require_tts()
     try:
         spec = await ws.receive_json()
     except Exception as e:
@@ -269,7 +310,7 @@ async def voice_clone(
     audio: UploadFile = File(...),
     voice_id: str = Form(...),
 ) -> dict[str, Any]:
-    backend = _require_tts()
+    backend = await _require_tts()
     if not backend.supports_cloning:
         raise HTTPException(
             501,
