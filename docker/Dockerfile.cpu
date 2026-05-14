@@ -22,13 +22,18 @@ COPY src ./src
 # Install only the cpu bundle — gpu deps deliberately excluded.
 RUN pip install -e ".[cpu]"
 
-# Pre-create the weights directory with sticky world-writable bits. When a
-# named volume is first attached at /srv/weights, Docker copies the perms from
-# this mountpoint into the new volume — so a non-root runtime user (e.g.
-# UID 1000 in the oasis-claw compose) can populate the volume on first boot
-# without needing CAP_CHOWN. Without this, moonshine-onnx's hf_hub_download
-# trips PermissionError on /srv/weights/huggingface.
-RUN mkdir -p /srv/weights && chmod 1777 /srv/weights
+# Pre-create the weights tree so a fresh named volume is immediately writable
+# by UID 1000 (set via `user:` in the oasis-claw compose). chmod 1777 on the
+# root is best-effort — Docker's propagation of a mount-point directory's own
+# mode to the volume root is not guaranteed on all platforms (notably Docker
+# Desktop for Mac). The portable fix is to pre-create the leaf dirs with 777:
+# Docker seeds directory *entries* (not just root-dir metadata) into fresh
+# volumes, so huggingface/ and oasis-voice/piper/ land with their bits intact
+# regardless. UID 1000 can then write into them even if the volume root is
+# 755 root:root.
+RUN mkdir -p /srv/weights/huggingface /srv/weights/oasis-voice/piper \
+    && chmod 1777 /srv/weights \
+    && chmod 777 /srv/weights/huggingface /srv/weights/oasis-voice /srv/weights/oasis-voice/piper
 
 # Weights are NOT baked in. The image runs `download-weights.py` on first boot
 # (or pulls from a mounted volume) so the same image works for any tier.
