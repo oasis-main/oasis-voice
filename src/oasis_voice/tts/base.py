@@ -30,14 +30,50 @@ class VoiceRef:
     """
     Identifies a voice. Either a preset name (`"piper:en_US-lessac-high"`)
     or a cloned voice id minted by /v1/voice/clone (`"clone:abc123"`).
+
+    For multi-speaker models, append ``#speaker`` to the voice_id
+    (e.g. ``"piper:en_GB-vctk-medium#p236"``). The backend resolves the
+    speaker name to an integer id via the model's speaker_id_map.
     """
     voice_id: str
     kind: Literal["preset", "clone"]
+    speaker: str | None = None
+
+
+@dataclass(frozen=True)
+class VoicePreset:
+    """
+    One installed, selectable voice, as reported by GET /v1/voices.
+
+    `speakers` is empty for a single-speaker model. For a multi-speaker model
+    it lists the selectable speaker names; a caller addresses one by appending
+    ``#speaker`` to the voice_id, the same form `_voice_ref` parses.
+    """
+    voice_id: str                    # fully qualified, e.g. "piper:en_GB-alan-medium"
+    speakers: tuple[str, ...] = ()
 
 
 class TTSBackend(ABC):
     supports_cloning: bool = False
     supports_streaming: bool = False
+
+    def list_presets(self) -> list[VoicePreset]:
+        """
+        Enumerate the preset voices this backend can serve RIGHT NOW.
+
+        Contract: this must be cheap and must NOT require warmup(). A caller
+        listing voices should not pay a cold model download. Piper resolves
+        voices from disk at request time, so its implementation is a directory
+        walk. A backend that genuinely cannot enumerate returns [].
+        """
+        return []
+
+    def list_cloned(self) -> list[VoicePreset]:
+        """
+        Enumerate cloned voices minted through /v1/voice/clone. Same cheapness
+        contract as list_presets. Backends without cloning return [].
+        """
+        return []
 
     @abstractmethod
     async def warmup(self) -> None: ...

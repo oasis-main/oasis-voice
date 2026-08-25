@@ -234,7 +234,12 @@ def _voice_ref(name: str | None) -> VoiceRef:
     if not name:
         return VoiceRef(voice_id="", kind="preset")
     kind = "clone" if name.startswith("clone:") else "preset"
-    return VoiceRef(voice_id=name, kind=kind)
+    speaker: str | None = None
+    voice_id = name
+    if kind == "preset" and "#" in name:
+        voice_id, speaker = name.rsplit("#", 1)
+        speaker = speaker.strip() or None
+    return VoiceRef(voice_id=voice_id, kind=kind, speaker=speaker)
 
 
 @app.post("/v1/tts/speak")
@@ -325,6 +330,28 @@ async def voice_clone(
 
 @app.get("/v1/voices")
 async def list_voices() -> dict[str, Any]:
-    # Preset registry is per-backend; lite/Piper resolves voices from disk
-    # at request time, so we intentionally don't enumerate them here yet.
-    return {"presets": [], "cloned": []}
+    """
+    Enumerate the voices a caller may select.
+
+    Deliberately does NOT go through _require_tts(): that warms the backend,
+    and warmup on the lite tier downloads a voice on first hit (~60s cold).
+    Listing is a filesystem walk, so it must stay cheap enough to call before
+    deciding which voice to use. A backend that has not been instantiated yet
+    still 503s, because "which voices exist" has no answer without one.
+    """
+    if _tts is None:
+        raise HTTPException(503, "TTS backend not instantiated yet")
+    presets = [
+        {"voice_id": v.voice_id, "speakers": list(v.speakers)}
+        for v in _tts.list_presets()
+    ]
+    cloned = [
+        {"voice_id": v.voice_id, "speakers": list(v.speakers)}
+        for v in _tts.list_cloned()
+    ]
+    return {
+        "presets": presets,
+        "cloned": cloned,
+        "backend": ACTIVE.tts.backend,
+        "supports_cloning": _tts.supports_cloning,
+    }

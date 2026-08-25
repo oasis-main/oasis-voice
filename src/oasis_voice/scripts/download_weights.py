@@ -56,6 +56,8 @@ PIPER_VOICE_CATALOG: dict[str, str] = {
     "en_US-lessac-medium": "en/en_US/lessac/medium/en_US-lessac-medium",
     "en_US-amy-medium":    "en/en_US/amy/medium/en_US-amy-medium",
     "en_GB-alan-medium":   "en/en_GB/alan/medium/en_GB-alan-medium",
+    "en_GB-aru-medium":    "en/en_GB/aru/medium/en_GB-aru-medium",
+    "en_GB-vctk-medium":   "en/en_GB/vctk/medium/en_GB-vctk-medium",
 }
 
 

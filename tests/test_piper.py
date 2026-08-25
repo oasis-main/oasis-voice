@@ -127,3 +127,103 @@ async def test_clone_voice_rejected(fake_piper):
     await backend.warmup()
     with pytest.raises(ValueError, match="preset"):
         await backend.speak("hi", VoiceRef(voice_id="clone:abc", kind="clone"))
+
+
+# ────────────── voice enumeration (CLAW-107 Phase 1) ──────────────
+#
+# GET /v1/voices used to be a stub returning empty lists, so a bot could not
+# discover what voices existed and therefore could not choose one. These cover
+# the directory walk that replaced it.
+
+
+def _write_voice(directory: Path, name: str, speakers: dict[str, int] | None = None) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    onnx = directory / f"{name}.onnx"
+    onnx.write_bytes(b"fake")
+    if speakers is not None:
+        import json as _json
+        (directory / f"{name}.onnx.json").write_text(_json.dumps({"speaker_id_map": speakers}))
+    return onnx
+
+
+def test_list_presets_walks_search_paths(tmp_path, monkeypatch):
+    _write_voice(tmp_path, "en_GB-alan-medium")
+    _write_voice(tmp_path, "en_GB-aru-medium")
+    monkeypatch.setenv("VOICE_PIPER_VOICE_DIR", str(tmp_path))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+
+    presets = PiperBackend().list_presets()
+
+    assert [p.voice_id for p in presets] == [
+        "piper:en_GB-alan-medium",
+        "piper:en_GB-aru-medium",
+    ]
+    assert all(p.speakers == () for p in presets)
+
+
+def test_list_presets_reports_multi_speaker_names(tmp_path, monkeypatch):
+    _write_voice(tmp_path, "en_GB-vctk-medium", speakers={"p236": 0, "p239": 1, "p244": 2})
+    monkeypatch.setenv("VOICE_PIPER_VOICE_DIR", str(tmp_path))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+
+    (preset,) = PiperBackend().list_presets()
+
+    assert preset.voice_id == "piper:en_GB-vctk-medium"
+    assert preset.speakers == ("p236", "p239", "p244")
+
+
+def test_list_presets_single_entry_map_reports_no_choice(tmp_path, monkeypatch):
+    # A one-speaker map is a single-speaker model. Reporting one option would
+    # imply a choice the caller does not actually have.
+    _write_voice(tmp_path, "en_GB-alan-medium", speakers={"only": 0})
+    monkeypatch.setenv("VOICE_PIPER_VOICE_DIR", str(tmp_path))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+
+    (preset,) = PiperBackend().list_presets()
+    assert preset.speakers == ()
+
+
+def test_list_presets_higher_priority_dir_shadows(tmp_path, monkeypatch):
+    # Same voice installed twice. resolve_voice_path returns the override copy,
+    # so enumeration must report it once, not twice.
+    override, xdg = tmp_path / "override", tmp_path / "xdg"
+    _write_voice(override, "en_GB-alan-medium", speakers={"a": 0, "b": 1})
+    _write_voice(xdg / "oasis-voice" / "piper", "en_GB-alan-medium")
+    monkeypatch.setenv("VOICE_PIPER_VOICE_DIR", str(override))
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg))
+
+    presets = PiperBackend().list_presets()
+
+    assert len(presets) == 1
+    assert presets[0].speakers == ("a", "b")  # the override copy won
+
+
+def test_list_presets_survives_missing_and_unreadable_dirs(tmp_path, monkeypatch):
+    monkeypatch.setenv("VOICE_PIPER_VOICE_DIR", str(tmp_path / "does-not-exist"))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    assert PiperBackend().list_presets() == []
+
+
+def test_list_presets_ignores_corrupt_sidecar(tmp_path, monkeypatch):
+    _write_voice(tmp_path, "en_GB-alan-medium")
+    (tmp_path / "en_GB-alan-medium.onnx.json").write_text("{not json")
+    monkeypatch.setenv("VOICE_PIPER_VOICE_DIR", str(tmp_path))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+
+    (preset,) = PiperBackend().list_presets()
+    assert preset.speakers == ()  # degrades, does not raise
+
+
+def test_list_presets_does_not_require_warmup(tmp_path, monkeypatch):
+    # THE contract for this method. Listing must not load a model: on the lite
+    # tier warmup downloads a voice (~60s cold), and a caller deciding WHICH
+    # voice to use must not pay that just to see the options.
+    _write_voice(tmp_path, "en_GB-alan-medium")
+    monkeypatch.setenv("VOICE_PIPER_VOICE_DIR", str(tmp_path))
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+
+    backend = PiperBackend()
+    assert backend._PiperVoice is None  # warmup() never called
+    assert len(backend.list_presets()) == 1
+    assert backend._PiperVoice is None  # and still not called
+    assert backend._voices == {}        # no model was loaded
