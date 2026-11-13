@@ -129,7 +129,10 @@ TTS_TIERS: dict[str, TierSpec] = {
         backend="piper",
         weights="rhasspy/piper-voices/en_US-lessac-high",
         revision="TBD",
-        sha256={},
+        sha256={
+            "en_GB-alan-medium.onnx":      "0a309668932205e762801f1efc2736cd4b0120329622adf62be09e56339d3330",
+            "en_GB-alan-medium.onnx.json": "c0f0d124e5895c00e7c03b35dcc8287f319a6998a365b182deb5c8e752ee8c1e",
+        },
         requires_gpu=False,
         vram_gb=0,
         license="MIT",

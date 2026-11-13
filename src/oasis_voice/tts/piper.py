@@ -24,6 +24,7 @@ not chunking inside a single sentence.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from collections.abc import AsyncIterator
@@ -31,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from ..audio import split_sentences
-from .base import AudioChunk, TTSBackend, VoiceRef
+from .base import AudioChunk, TTSBackend, VoicePreset, VoiceRef
 
 
 log = logging.getLogger(__name__)
@@ -96,6 +97,7 @@ class PiperBackend(TTSBackend):
         self._noise_scale = noise_scale
         self._noise_w = noise_w
         self._voices: dict[str, Any] = {}
+        self._speaker_maps: dict[str, dict[str, int]] = {}
         self._PiperVoice: Any = None
         self._SynthesisConfig: Any = None
 
@@ -146,16 +148,66 @@ class PiperBackend(TTSBackend):
         voice_id = voice.voice_id or self._default_voice
         piper_voice = await asyncio.to_thread(self._ensure_voice, voice_id)
         sample_rate = self._sample_rate_of(piper_voice)
+        speaker_id = self._resolve_speaker_id(voice_id, voice.speaker)
 
         for idx, sentence in enumerate(sentences):
             is_last = idx == len(sentences) - 1
-            pcm = await asyncio.to_thread(self._synthesize_one, piper_voice, sentence)
+            pcm = await asyncio.to_thread(
+                self._synthesize_one, piper_voice, sentence, speaker_id
+            )
             yield AudioChunk(
                 pcm=pcm,
                 sample_rate=sample_rate,
                 channels=1,
                 is_final=is_last,
             )
+
+    def list_presets(self) -> list[VoicePreset]:
+        """
+        Walk the voice search paths and report every installed .onnx.
+
+        Filesystem only — deliberately does NOT call warmup() or load a model,
+        because listing must not cost a cold voice download (see the contract on
+        TTSBackend.list_presets). Speaker names come from the JSON sidecar that
+        already sits next to every Piper model, so a multi-speaker voice reports
+        its selectable speakers without instantiating anything.
+
+        Earlier search paths win, matching resolve_voice_path's precedence, so a
+        voice shadowed by a higher-priority directory is reported once.
+        """
+        seen: dict[str, VoicePreset] = {}
+        for d in _voice_search_paths():
+            try:
+                if not d.is_dir():
+                    continue
+                entries = sorted(d.glob("*.onnx"))
+            except OSError as e:  # unreadable mount, bad symlink
+                log.warning("cannot list piper voices in %s: %s", d, e)
+                continue
+            for onnx in entries:
+                name = onnx.stem
+                if name in seen:
+                    continue  # higher-priority directory already provided it
+                seen[name] = VoicePreset(
+                    voice_id=f"piper:{name}",
+                    speakers=self._peek_speakers(onnx),
+                )
+        return [seen[k] for k in sorted(seen)]
+
+    def _peek_speakers(self, model_path: Path) -> tuple[str, ...]:
+        """Read speaker names from the model's JSON sidecar without loading it."""
+        json_path = Path(str(model_path) + ".json")
+        try:
+            with open(json_path) as f:
+                cfg = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return ()
+        sid_map = cfg.get("speaker_id_map")
+        if not isinstance(sid_map, dict) or len(sid_map) <= 1:
+            # A single-entry map is a single-speaker model; report no choice
+            # rather than one meaningless option.
+            return ()
+        return tuple(sorted(sid_map))
 
     # ───────────────────── internal helpers ──────────────────────
 
@@ -169,9 +221,43 @@ class PiperBackend(TTSBackend):
         log.info("loading piper voice from %s", path)
         loaded = self._PiperVoice.load(str(path))
         self._voices[name] = loaded
+        self._load_speaker_map(name, path)
         return loaded
 
-    def _synthesize_one(self, piper_voice: Any, sentence: str) -> bytes:
+    def _load_speaker_map(self, name: str, model_path: Path) -> None:
+        """Load speaker_id_map from the model's JSON config sidecar."""
+        if name in self._speaker_maps:
+            return
+        json_path = Path(str(model_path) + ".json")
+        if not json_path.exists():
+            return
+        try:
+            with open(json_path) as f:
+                cfg = json.load(f)
+            sid_map = cfg.get("speaker_id_map")
+            if isinstance(sid_map, dict) and sid_map:
+                self._speaker_maps[name] = sid_map
+                log.info("loaded %d speakers for %s", len(sid_map), name)
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning("failed to read speaker map from %s: %s", json_path, e)
+
+    def _resolve_speaker_id(self, voice_id: str, speaker: str | None) -> int | None:
+        if speaker is None:
+            return None
+        name = voice_id.split(":", 1)[-1]
+        sid_map = self._speaker_maps.get(name)
+        if sid_map and speaker in sid_map:
+            return sid_map[speaker]
+        try:
+            return int(speaker)
+        except ValueError:
+            available = list((sid_map or {}).keys())[:10]
+            raise ValueError(
+                f"Unknown speaker '{speaker}' for voice '{name}'. "
+                f"Available: {available}"
+            )
+
+    def _synthesize_one(self, piper_voice: Any, sentence: str, speaker_id: int | None = None) -> bytes:
         """
         Render one sentence to int16 PCM bytes. Piper exposes both a
         chunk-iterator API (modern) and a `synthesize_stream_raw` (older);
@@ -181,11 +267,14 @@ class PiperBackend(TTSBackend):
         if hasattr(piper_voice, "synthesize"):
             kwargs: dict[str, Any] = {}
             if self._SynthesisConfig is not None:
-                kwargs["syn_config"] = self._SynthesisConfig(
-                    length_scale=self._length_scale,
-                    noise_scale=self._noise_scale,
-                    noise_w_scale=self._noise_w,
-                )
+                syn_kwargs: dict[str, Any] = {
+                    "length_scale": self._length_scale,
+                    "noise_scale": self._noise_scale,
+                    "noise_w_scale": self._noise_w,
+                }
+                if speaker_id is not None:
+                    syn_kwargs["speaker_id"] = speaker_id
+                kwargs["syn_config"] = self._SynthesisConfig(**syn_kwargs)
             buf = bytearray()
             for chunk in piper_voice.synthesize(sentence, **kwargs):
                 # Newer chunks have `.audio_int16_bytes`; older return raw bytes.
@@ -205,6 +294,10 @@ class PiperBackend(TTSBackend):
             "Loaded piper voice exposes neither synthesize() nor "
             "synthesize_stream_raw(); piper-tts API has changed."
         )
+
+    @property
+    def speaker_maps(self) -> dict[str, dict[str, int]]:
+        return self._speaker_maps
 
     @staticmethod
     def _sample_rate_of(piper_voice: Any) -> int:

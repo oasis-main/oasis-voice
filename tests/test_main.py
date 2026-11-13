@@ -50,8 +50,20 @@ class StubTTS(TTSBackend):
     supports_streaming = True
     supports_cloning = False
 
+    def __init__(self) -> None:
+        self.warmed = False
+
     async def warmup(self) -> None:
+        self.warmed = True
         return None
+
+    def list_presets(self):
+        from oasis_voice.tts.base import VoicePreset
+
+        return [
+            VoicePreset(voice_id="piper:en_GB-alan-medium"),
+            VoicePreset(voice_id="piper:en_GB-vctk-medium", speakers=("p236", "p239")),
+        ]
 
     async def speak(self, text, voice):
         pcm = float32_to_pcm16(np.zeros(1600, dtype=np.float32))  # 0.1s @ 16k
@@ -120,6 +132,40 @@ def test_tts_speak(client):
     assert r.content[:4] == b"RIFF"
 
 
+def test_tts_speak_rejects_unknown_format(client):
+    r = client.post(
+        "/v1/tts/speak?format=mp3",
+        json={"text": "hi"},
+    )
+    assert r.status_code == 400
+    assert "unsupported format" in r.json()["detail"]
+
+
+def test_tts_speak_opus_calls_encoder(client, monkeypatch):
+    """
+    With format=opus the endpoint should route through encode_opus.
+    We monkeypatch the encoder so this works on hosts without ffmpeg
+    (the real-ffmpeg path is covered in test_audio.py's
+    test_encode_opus_roundtrip_via_real_ffmpeg).
+    """
+    import oasis_voice.main as voice_main
+
+    called = {"hit": False, "args": None}
+
+    def fake_encode(pcm, sample_rate, channels=1):
+        called["hit"] = True
+        called["args"] = (len(pcm), sample_rate, channels)
+        return b"OggS" + b"\x00" * 64
+
+    monkeypatch.setattr(voice_main, "encode_opus", fake_encode)
+
+    r = client.post("/v1/tts/speak?format=opus", json={"text": "hi"})
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "audio/ogg"
+    assert r.content.startswith(b"OggS")
+    assert called["hit"], "encode_opus was not called"
+
+
 def test_voice_clone_unsupported(client):
     pcm = float32_to_pcm16(np.zeros(16000, dtype=np.float32))
     wav = encode_wav(pcm, sample_rate=16000)
@@ -129,3 +175,45 @@ def test_voice_clone_unsupported(client):
         data={"voice_id": "test"},
     )
     assert r.status_code == 501
+
+
+# ────────────── GET /v1/voices (CLAW-107 Phase 1) ──────────────
+
+
+def test_list_voices_enumerates_presets(client):
+    r = client.get("/v1/voices")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["presets"] == [
+        {"voice_id": "piper:en_GB-alan-medium", "speakers": []},
+        {"voice_id": "piper:en_GB-vctk-medium", "speakers": ["p236", "p239"]},
+    ]
+    assert body["cloned"] == []
+    assert body["supports_cloning"] is False
+    assert "backend" in body
+
+
+def test_list_voices_does_not_warm_the_backend(client, monkeypatch):
+    # /v1/voices deliberately bypasses _require_tts(). Warming on the lite tier
+    # downloads a voice on first hit, and listing must stay cheap enough to call
+    # before choosing a voice.
+    from oasis_voice import main as main_module
+
+    called = {"warmed": False}
+
+    async def boom():
+        called["warmed"] = True
+        raise AssertionError("/v1/voices must not trigger warmup")
+
+    monkeypatch.setattr(main_module, "_ensure_tts_warmed", boom)
+    r = client.get("/v1/voices")
+    assert r.status_code == 200
+    assert called["warmed"] is False
+
+
+def test_list_voices_503_without_a_backend(client, monkeypatch):
+    from oasis_voice import main as main_module
+
+    monkeypatch.setattr(main_module, "_tts", None)
+    r = client.get("/v1/voices")
+    assert r.status_code == 503
